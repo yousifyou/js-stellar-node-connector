@@ -1,5 +1,5 @@
 import BigNumber from 'bignumber.js';
-import { Keypair, xdr, hash, StrKey } from 'stellar-base';
+import { hash, Keypair, StrKey, xdr } from 'stellar-base';
 import { err, ok, Result } from 'neverthrow';
 import { Socket } from 'net';
 import { ConnectionAuthentication } from './connection-authentication';
@@ -12,11 +12,12 @@ import {
 	AuthenticatedMessageV0,
 	parseAuthenticatedMessageXDR
 } from './xdr-message-handler';
-
-import StellarMessage = xdr.StellarMessage;
-import MessageType = xdr.MessageType;
 import * as P from 'pino';
 import { NodeInfo } from '../node';
+import { FlowController } from './flow-controller';
+import StellarMessage = xdr.StellarMessage;
+import MessageType = xdr.MessageType;
+import { mapUnknownToError } from '../map-unknown-to-error';
 
 type PublicKey = string;
 
@@ -42,6 +43,12 @@ export type ConnectionOptions = {
 	remoteCalledUs: boolean;
 	receiveTransactionMessages: boolean;
 	receiveSCPMessages: boolean;
+	maxFloodMessageCapacity: number;
+};
+
+export type StellarMessageWork = {
+	stellarMessage: StellarMessage;
+	done: () => void; //flow control: call when done processing
 };
 
 /**
@@ -68,26 +75,24 @@ export class Connection extends Duplex {
 	protected readState: ReadState = ReadState.ReadyForLength;
 	protected handshakeState: HandshakeState = HandshakeState.CONNECTING;
 	protected remoteCalledUs = true;
-	protected connectionAuthentication: ConnectionAuthentication;
-	protected socket: Socket;
-	protected logger: P.Logger;
 	protected receiveTransactionMessages = true;
 	protected receiveSCPMessages = true;
-
 	public localNodeInfo: NodeInfo;
 	public remoteNodeInfo?: NodeInfo;
-
+	public sendMoreMsgReceivedCounter = 0;
 	public remoteIp: string;
 	public remotePort: number;
 
 	public remotePublicKey?: string;
 	public remotePublicKeyRaw?: Buffer;
 
+	private flowController: FlowController;
+
 	constructor(
 		connectionOptions: ConnectionOptions,
-		socket: Socket,
-		connectionAuth: ConnectionAuthentication,
-		logger: P.Logger
+		private socket: Socket,
+		private readonly connectionAuthentication: ConnectionAuthentication,
+		private logger: P.Logger
 	) {
 		super({ objectMode: true });
 		this.remoteIp = connectionOptions.ip;
@@ -96,7 +101,7 @@ export class Connection extends Duplex {
 		if (this.socket.readable) this.handshakeState = HandshakeState.CONNECTED;
 		this.remoteCalledUs = connectionOptions.remoteCalledUs;
 		this.socket.setTimeout(2500);
-		this.connectionAuthentication = connectionAuth;
+		this.connectionAuthentication = connectionAuthentication;
 		this.keyPair = connectionOptions.keyPair;
 		this.localNonce = hash(Buffer.from(BigNumber.random()));
 		this.localSequence = Buffer.alloc(8);
@@ -106,6 +111,10 @@ export class Connection extends Duplex {
 		this.receiveSCPMessages = connectionOptions.receiveSCPMessages;
 		this.receiveTransactionMessages =
 			connectionOptions.receiveTransactionMessages;
+
+		this.flowController = new FlowController(
+			connectionOptions.maxFloodMessageCapacity
+		);
 
 		this.socket.on('close', (hadError) => this.emit('close', hadError));
 		this.socket.on('connect', () => this.onConnected());
@@ -252,9 +261,10 @@ export class Connection extends Duplex {
 					setImmediate(() => done(null)); //other sockets will be able to process messages
 				} else done(null); //another iteration
 			},
-			(error) => {
+			(err) => {
 				//function gets called when we are no longer reading
-				if (error) {
+				if (err) {
+					const error = mapUnknownToError(err);
 					this.logger.error(
 						{ remote: this.remoteAddress, local: this.localAddress },
 						error.message
@@ -310,8 +320,7 @@ export class Connection extends Duplex {
 				remote: this.remoteAddress,
 				local: this.localAddress
 			},
-			//@ts-ignore
-			'Rcv ' + MessageType.fromValue(messageType).name
+			'Rcv ' + messageType
 		);
 
 		if (
@@ -319,6 +328,7 @@ export class Connection extends Duplex {
 			!this.receiveTransactionMessages
 		) {
 			this.increaseRemoteSequenceByOne();
+			this.doneProcessing(MessageType.transaction());
 			return ok(true);
 		}
 
@@ -463,6 +473,11 @@ export class Connection extends Duplex {
 				return ok(true);
 			}
 
+			case MessageType.sendMore(): {
+				this.sendMoreMsgReceivedCounter++; //server send more functionality not implemented; only for testing purposes;
+				return ok(true);
+			}
+
 			default:
 				// we push non-handshake messages to our readable buffer for our consumers
 				this.logger.debug(
@@ -472,7 +487,13 @@ export class Connection extends Duplex {
 					},
 					'Rcv ' + stellarMessage.switch().name
 				);
-				return ok(this.push(stellarMessage));
+
+				return ok(
+					this.push({
+						stellarMessage: stellarMessage,
+						done: () => this.doneProcessing(stellarMessage.switch())
+					} as StellarMessageWork)
+				);
 		}
 	}
 
@@ -523,7 +544,25 @@ export class Connection extends Duplex {
 		this.emit('connect', this.remotePublicKey, this.remoteNodeInfo);
 		this.emit('ready');
 
+		if (!this.remoteNodeInfo)
+			throw new Error('No remote overlay version after handshake');
+
+		this.flowController.enableIfValidOverlayVersions(
+			this.localNodeInfo.overlayVersion,
+			this.remoteNodeInfo.overlayVersion
+		);
+		this.doneProcessing();
+
 		return ok(undefined);
+	}
+
+	protected doneProcessing(messageType?: MessageType): void {
+		if (!this.flowController.sendMore(messageType)) return;
+
+		const sendMore = new xdr.SendMore({
+			numMessages: this.flowController.maxFloodMessageCapacity
+		});
+		this.sendStellarMessage(xdr.StellarMessage.sendMore(sendMore));
 	}
 
 	/**
